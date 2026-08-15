@@ -1,0 +1,39 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+.DS_Store
+dist
+dist-ssr
+coverage
+*.local
+stats.html
+database/connection.env
+database/sqlite/*.db
+database/sqlite/*.db-*
+
+/cypress/videos/
+/cypress/screenshots/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+/src/typings/components.d.ts
+# pnpm-lock.yaml 纳入版本库，保证 CI 可复现
+package-lock.json
+yarn.lock
+backups/

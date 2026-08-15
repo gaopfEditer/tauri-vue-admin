@@ -1,0 +1,11 @@
+.vscode
+.idea
+.local
+!.env-config.ts
+components.d.ts
+md/
+database/
+src-tauri/
+dist/
+logs/
+backups/
