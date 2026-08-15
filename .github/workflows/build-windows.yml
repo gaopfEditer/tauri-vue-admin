@@ -32,7 +32,8 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 8
+          # lockfileVersion 9 需要 pnpm 9+（pnpm 8 会忽略该锁文件）
+          version: 9
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -49,13 +50,7 @@ jobs:
           workspaces: src-tauri -> target
 
       - name: Install frontend dependencies
-        run: |
-          if (Test-Path pnpm-lock.yaml) {
-            pnpm install --frozen-lockfile
-          } else {
-            pnpm install --no-frozen-lockfile
-          }
-        shell: pwsh
+        run: pnpm install --frozen-lockfile
 
       - name: Build Tauri (Windows)
         # beforeBuildCommand 会跑前端 typecheck + vite build，再编 Rust release 并打 bundle
