@@ -20,6 +20,7 @@ export default function unplugin(viteEnv: ImportMetaEnv) {
     VueMacros(),
     Icons({
       compiler: 'vue3',
+      autoInstall: false,
       customCollections: {
         [collectionName]: FileSystemIconLoader(localIconPath)
       },
