@@ -1,0 +1,32 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+license = ""
+repository = ""
+default-run = "app"
+edition = "2021"
+rust-version = "1.70"
+
+[build-dependencies]
+tauri-build = { version = "1.1.1", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tauri = { version = "1.1.1", features = ["api-all"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono", "json"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+dotenvy = "0.15"
+md5 = "0.7"
+uuid = { version = "1", features = ["v4"] }
+mac_address = "1.1"
+base64 = "0.22"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
