@@ -12,7 +12,7 @@ export default defineConfig(configEnv => {
   const envConfig = getServiceEnvConfig(viteEnv);
 
   return {
-    base: viteEnv.VITE_BASE_URL,
+    base: viteEnv.VITE_BASE_URL || '/',
     resolve: {
       alias: {
         '~': rootPath,

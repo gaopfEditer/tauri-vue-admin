@@ -18,6 +18,11 @@ database/connection.env
 database/sqlite/*.db
 database/sqlite/*.db-*
 
+# 本地机密环境变量（公开构建变量放 .env.production / .env.example）
+.env
+.env.local
+.env.*.local
+
 /cypress/videos/
 /cypress/screenshots/
 
