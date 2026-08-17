@@ -1,9 +1,12 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Sqlite, Pool};
-use std::path::PathBuf;
+use sqlx::{Pool, Sqlite};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 pub type DbPool = Pool<Sqlite>;
+
+const SCHEMA_SQL: &str = include_str!("../../database/sqlite/field-schema.sql");
+const SEED_SQL: &str = include_str!("../../database/sqlite/field-seed.sql");
 
 pub struct DbConfig {
   pub driver: String,
@@ -23,12 +26,10 @@ pub struct DbConfig {
 
 impl DbConfig {
   pub fn from_env() -> Self {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let default_sqlite = manifest.join("../database/sqlite/field-test.db");
     Self {
       driver: std::env::var("DB_DRIVER").unwrap_or_else(|_| "sqlite".to_string()),
       sqlite_path: PathBuf::from(
-        std::env::var("DB_SQLITE_PATH").unwrap_or_else(|_| default_sqlite.display().to_string()),
+        std::env::var("DB_SQLITE_PATH").unwrap_or_else(|_| "field-test.db".to_string()),
       ),
       host: std::env::var("DB_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
       port: std::env::var("DB_PORT")
@@ -40,25 +41,38 @@ impl DbConfig {
       password: std::env::var("DB_PASSWORD").unwrap_or_default(),
     }
   }
+
+  /// 安装包/现场：把相对路径落到可写的应用数据目录
+  pub fn resolve_for_runtime(mut self, data_dir: &Path) -> Self {
+    if self.sqlite_path.is_relative() {
+      self.sqlite_path = data_dir.join(&self.sqlite_path);
+    }
+    self
+  }
 }
 
 pub fn load_env() {
-  let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+  // 1) 开发：仓库根 .env
+  let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
   let connection_env = manifest.join("../database/connection.env");
   if connection_env.exists() {
     let _ = dotenvy::from_path(&connection_env);
   }
   let _ = dotenvy::from_path_override(manifest.join("../.env"));
+
+  // 2) 安装包：exe 同目录 .env（现场可放配置）
+  if let Ok(exe) = std::env::current_exe() {
+    if let Some(dir) = exe.parent() {
+      let _ = dotenvy::from_path_override(dir.join(".env"));
+    }
+  }
+
+  // 3) 当前工作目录
+  let _ = dotenvy::from_path_override(PathBuf::from(".env"));
 }
 
-fn sql_dir() -> PathBuf {
-  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../database/sqlite")
-}
-
-async fn exec_sql_file(pool: &DbPool, path: &std::path::Path) -> Result<(), sqlx::Error> {
-  let raw = std::fs::read_to_string(path).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
-  // 按分号拆分；跳过空语句与纯注释块
-  for stmt in split_statements(&raw) {
+async fn exec_sql_script(pool: &DbPool, raw: &str) -> Result<(), sqlx::Error> {
+  for stmt in split_statements(raw) {
     sqlx::query(&stmt).execute(pool).await?;
   }
   Ok(())
@@ -90,28 +104,16 @@ fn split_statements(sql: &str) -> Vec<String> {
 }
 
 async fn bootstrap_schema_and_seed(pool: &DbPool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-  let dir = sql_dir();
-  let schema = dir.join("field-schema.sql");
-  let seed = dir.join("field-seed.sql");
-
-  crate::syslog::info(
-    "db",
-    "schema",
-    &format!("应用 SQLite schema: {}", schema.display()),
-  );
-  exec_sql_file(pool, &schema).await?;
+  crate::syslog::info("db", "schema", "应用内置 SQLite schema");
+  exec_sql_script(pool, SCHEMA_SQL).await?;
 
   let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sys_user")
     .fetch_one(pool)
     .await?;
 
-  if user_count.0 == 0 && seed.exists() {
-    crate::syslog::info(
-      "db",
-      "seed",
-      &format!("空库，写入种子数据: {}", seed.display()),
-    );
-    exec_sql_file(pool, &seed).await?;
+  if user_count.0 == 0 {
+    crate::syslog::info("db", "seed", "空库，写入内置种子数据");
+    exec_sql_script(pool, SEED_SQL).await?;
   } else {
     crate::syslog::info(
       "db",
@@ -120,7 +122,6 @@ async fn bootstrap_schema_and_seed(pool: &DbPool) -> Result<(), Box<dyn std::err
     );
   }
 
-  // 确保联调/授权菜单存在（现场临时）
   let _ = sqlx::query(
     "INSERT OR IGNORE INTO sys_menu
      (id, parent_id, route_name, path, component, title, icon, order_num, hide, requires_auth, menu_type, status)
@@ -158,10 +159,12 @@ pub async fn init(config: &DbConfig) -> Result<DbPool, Box<dyn std::error::Error
   }
 
   if let Some(parent) = config.sqlite_path.parent() {
-    let _ = std::fs::create_dir_all(parent);
+    std::fs::create_dir_all(parent)?;
   }
 
-  let url = format!("sqlite:{}?mode=rwc", config.sqlite_path.display());
+  // Windows 路径在 sqlite URL 里需要用正斜杠更稳妥
+  let path_str = config.sqlite_path.display().to_string().replace('\\', "/");
+  let url = format!("sqlite:{path_str}?mode=rwc");
   crate::syslog::info_detail(
     "db",
     "connect",
