@@ -2,7 +2,6 @@ import type { PluginOption } from 'vite';
 import vue from '@vitejs/plugin-vue';
 import vueJsx from '@vitejs/plugin-vue-jsx';
 import unocss from '@unocss/vite';
-import { VitePWA } from 'vite-plugin-pwa';
 import progress from 'vite-plugin-progress';
 import html from './html';
 import unplugin from './unplugin';
@@ -15,7 +14,7 @@ import compress from './compress';
  * @param viteEnv - 环境变量配置
  */
 export function setupVitePlugins(viteEnv: ImportMetaEnv): (PluginOption | PluginOption[])[] {
-  const plugins = [vue(), vueJsx(), VitePWA(), html(viteEnv), ...unplugin(viteEnv), unocss(), progress()];
+  const plugins = [vue(), vueJsx(), html(viteEnv), ...unplugin(viteEnv), unocss(), progress()];
 
   // 桌面端走 Tauri 本地 API + MySQL，禁用 Vite Mock 避免抢接口
   if (viteEnv.VITE_DESKTOP_API !== 'Y') {

@@ -57,12 +57,18 @@
         <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
           <n-gi>
             <n-form-item label="从机地址">
-              <n-input v-model:value="form.slaveAddress" placeholder="如：40001" />
+              <n-input v-model:value="form.slaveAddress" placeholder="Unit ID，通常填 1" />
             </n-form-item>
           </n-gi>
           <n-gi>
-            <n-form-item label="PLC IP">
-              <n-select v-model:value="form.plcIp" :options="plcOptions" filterable tag />
+            <n-form-item :label="form.protocol === 'ModbusRTU' ? '串口(COM)' : 'PLC IP'">
+              <n-select
+                v-model:value="form.plcIp"
+                :options="form.protocol === 'ModbusRTU' ? serialOptions : plcOptions"
+                filterable
+                tag
+                :placeholder="form.protocol === 'ModbusRTU' ? '如 COM3 或 COM3@19200' : '如 192.168.1.50'"
+              />
             </n-form-item>
           </n-gi>
           <n-gi>
@@ -210,8 +216,15 @@ const instrumentOptions: SelectOption[] = [
   { label: '尘埃粒子5.0', value: '尘埃粒子5.0' }
 ];
 const plcOptions: SelectOption[] = [
-  { label: 'PLC1', value: 'PLC1' },
-  { label: 'PLC2', value: 'PLC2' }
+  { label: '192.168.1.50', value: '192.168.1.50' },
+  { label: 'PLC1(占位-勿用于联调)', value: 'PLC1' },
+  { label: 'PLC2(占位-勿用于联调)', value: 'PLC2' }
+];
+const serialOptions: SelectOption[] = [
+  { label: 'COM3 @19200', value: 'COM3@19200' },
+  { label: 'COM4', value: 'COM4' },
+  { label: 'COM5', value: 'COM5' },
+  { label: 'COM3', value: 'COM3' }
 ];
 const dataTypeOptions: SelectOption[] = [
   { label: 'ulong', value: 'ulong' },
@@ -219,8 +232,8 @@ const dataTypeOptions: SelectOption[] = [
   { label: 'int', value: 'int' }
 ];
 const protocolOptions: SelectOption[] = [
-  { label: 'ModbusTCP', value: 'ModbusTCP' },
   { label: 'ModbusRTU', value: 'ModbusRTU' },
+  { label: 'ModbusTCP', value: 'ModbusTCP' },
   { label: 'OPC UA', value: 'OPCUA' }
 ];
 const modeOptions: SelectOption[] = [
@@ -247,37 +260,42 @@ const thresholdMap = reactive<Record<string, ThrDraft>>({});
 
 const form = reactive({
   facilityNodeId: null as string | null,
-  deviceName: '',
-  deviceCode: '',
+  deviceName: '粒子计数器-1号',
+  deviceCode: 'PC-001',
   instrumentType: '尘埃粒子0.5' as string | null,
   updateIntervalSec: 60,
-  slaveAddress: '',
-  plcIp: 'PLC1' as string | null,
+  slaveAddress: '1',
+  plcIp: 'COM3@19200',
   dataUnit: 'pt/3',
   dataType: 'ulong',
   dataLength: 4,
-  protocol: 'ModbusTCP',
+  protocol: 'ModbusRTU',
   decimalPlaces: 0,
   cleanroomClass: 'Class A',
   serialNumber: '',
-  calibrationDate: '',
+  calibrationDate: '2026-01-01',
   operatingMode: 'Operational' as string | null,
   productionState: 'production' as string | null,
   flowRate: null as number | null
 });
+
+const thresholdDefaults: Record<string, ThrDraft> = {
+  'production::0.5um': { alarmEnable: 'unlimited', warnHigh: 3520, warnLow: null, alarmHigh: 35200, alarmLow: null },
+  'production::5.0um': { alarmEnable: 'unlimited', warnHigh: 20, warnLow: null, alarmHigh: 352, alarmLow: null },
+  'idle::0.5um': { alarmEnable: 'unlimited', warnHigh: 3520, warnLow: null, alarmHigh: 35200, alarmLow: null },
+  'idle::5.0um': { alarmEnable: 'unlimited', warnHigh: 20, warnLow: null, alarmHigh: 352, alarmLow: null },
+  'cleaning::0.5um': { alarmEnable: 'unlimited', warnHigh: 3520, warnLow: null, alarmHigh: 35200, alarmLow: null },
+  'cleaning::5.0um': { alarmEnable: 'unlimited', warnHigh: 20, warnLow: null, alarmHigh: 352, alarmLow: null },
+  'maintenance::0.5um': { alarmEnable: 'unlimited', warnHigh: 35200, warnLow: null, alarmHigh: 352000, alarmLow: null },
+  'maintenance::5.0um': { alarmEnable: 'unlimited', warnHigh: 352, warnLow: null, alarmHigh: 3520, alarmLow: null }
+};
 
 function ensureThresholdDefaults() {
   for (const g of stateGroups) {
     for (const m of metricKeys) {
       const key = `${g.value}::${m}`;
       if (!thresholdMap[key]) {
-        thresholdMap[key] = {
-          alarmEnable: 'unlimited',
-          warnHigh: null,
-          warnLow: null,
-          alarmHigh: null,
-          alarmLow: null
-        };
+        thresholdMap[key] = { ...thresholdDefaults[key] };
       }
     }
   }

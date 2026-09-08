@@ -1,4 +1,4 @@
-//! Modbus TCP 主站轮询 + 现场联调日志
+//! Modbus TCP / RTU(RS-485) 主站轮询 + 现场联调日志
 
 use axum::{
   extract::{Query, State},
@@ -20,6 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
+use tokio_serial::{SerialPortBuilderExt, SerialStream};
 
 use crate::server::{err, ok, ApiError, ApiResponse, AppState};
 
@@ -27,6 +28,9 @@ const MAX_LOGS: usize = 500;
 const DEFAULT_PORT: u16 = 502;
 const CONNECT_TIMEOUT_MS: u64 = 3000;
 const IO_TIMEOUT_MS: u64 = 3000;
+const RTU_IO_TIMEOUT_MS: u64 = 2000;
+const DEFAULT_RTU_BAUD: u32 = 19200;
+const DEFAULT_RTU_INPUT_COUNT: u16 = 16;
 
 static POLL_ENABLED: AtomicBool = AtomicBool::new(true);
 static POLL_CYCLE: AtomicU64 = AtomicU64::new(0);
@@ -315,6 +319,195 @@ impl ModbusTcp {
   }
 }
 
+fn modbus_crc16(data: &[u8]) -> u16 {
+  let mut crc = 0xFFFFu16;
+  for &b in data {
+    crc ^= u16::from(b);
+    for _ in 0..8 {
+      if crc & 0x0001 != 0 {
+        crc = (crc >> 1) ^ 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  crc
+}
+
+fn parse_serial_endpoint(raw: &str) -> Option<(String, u32)> {
+  let t = raw.trim();
+  if t.is_empty() {
+    return None;
+  }
+  // 排除 TCP 占位
+  if t.eq_ignore_ascii_case("PLC1") || t.eq_ignore_ascii_case("PLC2") {
+    return None;
+  }
+  let default_baud = std::env::var("MODBUS_RTU_BAUD")
+    .ok()
+    .and_then(|s| s.parse().ok())
+    .unwrap_or(DEFAULT_RTU_BAUD);
+
+  // COM3@19200 或 COM3:19200（后者若像 IP 则不走这里）
+  if let Some((port, baud_s)) = t.rsplit_once('@') {
+    let baud = baud_s.parse().unwrap_or(default_baud);
+    let port = port.trim();
+    if !port.is_empty() {
+      return Some((port.to_string(), baud));
+    }
+  }
+  // 纯串口名：COM3 / /dev/ttyUSB0
+  if t.to_ascii_uppercase().starts_with("COM") || t.starts_with("/dev/") {
+    return Some((t.to_string(), default_baud));
+  }
+  None
+}
+
+fn normalize_serial_port(port: &str) -> String {
+  // Windows COM10+ 需要 \\.\COMx；COM3 也可统一加前缀更稳
+  let u = port.to_ascii_uppercase();
+  if u.starts_with("COM") && !port.starts_with(r"\\.\") {
+    format!(r"\\.\{port}")
+  } else {
+    port.to_string()
+  }
+}
+
+fn regs_to_f32_abcd(hi: u16, lo: u16) -> f32 {
+  let raw = ((hi as u32) << 16) | (lo as u32);
+  f32::from_bits(raw)
+}
+
+fn regs_to_f32_cdab(hi: u16, lo: u16) -> f32 {
+  regs_to_f32_abcd(lo, hi)
+}
+
+/// Modbus RTU（RS-485 / USB 串口）客户端：功能码 04 等
+struct ModbusRtu {
+  stream: SerialStream,
+  unit_id: u8,
+}
+
+impl ModbusRtu {
+  async fn open(port: &str, baud: u32, unit_id: u8) -> Result<Self, String> {
+    let path = normalize_serial_port(port);
+    let stream = tokio_serial::new(&path, baud)
+      .data_bits(tokio_serial::DataBits::Eight)
+      .parity(tokio_serial::Parity::None)
+      .stop_bits(tokio_serial::StopBits::One)
+      .timeout(Duration::from_millis(RTU_IO_TIMEOUT_MS))
+      .open_native_async()
+      .map_err(|e| format!("打开串口 {port}@{baud} 失败: {e}"))?;
+    Ok(Self { stream, unit_id })
+  }
+
+  async fn transaction(&mut self, pdu: &[u8]) -> Result<Vec<u8>, String> {
+    let mut frame = Vec::with_capacity(pdu.len() + 3);
+    frame.push(self.unit_id);
+    frame.extend_from_slice(pdu);
+    let crc = modbus_crc16(&frame);
+    frame.push((crc & 0xFF) as u8);
+    frame.push((crc >> 8) as u8);
+
+    // 发送前短暂静默，利于 485 半双工切换
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    timeout(
+      Duration::from_millis(RTU_IO_TIMEOUT_MS),
+      self.stream.write_all(&frame),
+    )
+    .await
+    .map_err(|_| "RTU 写请求超时".to_string())?
+    .map_err(|e| format!("RTU 写请求失败: {e}"))?;
+    let _ = self.stream.flush().await;
+
+    let data = self.read_frame().await?;
+    let n = data.len();
+    if n < 5 {
+      return Err(format!("RTU 响应过短 ({n} bytes)"));
+    }
+    let body = &data[..n - 2];
+    let got = u16::from(data[n - 2]) | (u16::from(data[n - 1]) << 8);
+    let expect = modbus_crc16(body);
+    if got != expect {
+      return Err(format!("RTU CRC 错误 expect=0x{expect:04X} got=0x{got:04X}"));
+    }
+    if body[0] != self.unit_id {
+      return Err(format!("RTU 从站地址不匹配: {}", body[0]));
+    }
+    let pdu_resp = &body[1..];
+    if pdu_resp.first().map(|b| b & 0x80) == Some(0x80) {
+      let code = pdu_resp.get(1).copied().unwrap_or(0);
+      return Err(format!("Modbus 异常码 0x{code:02X}"));
+    }
+    Ok(pdu_resp.to_vec())
+  }
+
+  async fn read_frame(&mut self) -> Result<Vec<u8>, String> {
+    let mut acc = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(RTU_IO_TIMEOUT_MS);
+    while Instant::now() < deadline {
+      let mut tmp = [0u8; 64];
+      match timeout(Duration::from_millis(80), self.stream.read(&mut tmp)).await {
+        Ok(Ok(0)) => {
+          if !acc.is_empty() {
+            break;
+          }
+        }
+        Ok(Ok(n)) => {
+          acc.extend_from_slice(&tmp[..n]);
+          if acc.len() >= 5 {
+            if acc.get(1).map(|b| b & 0x80) == Some(0x80) {
+              // 异常帧：addr+fc+ex+crc = 5
+              if acc.len() >= 5 {
+                return Ok(acc[..5].to_vec());
+              }
+            } else if acc.get(1) == Some(&0x04) && acc.len() >= 3 {
+              let bc = acc[2] as usize;
+              let expect = 3 + bc + 2;
+              if acc.len() >= expect {
+                return Ok(acc[..expect].to_vec());
+              }
+            }
+          }
+        }
+        Ok(Err(e)) => return Err(format!("RTU 读响应失败: {e}")),
+        Err(_) => {
+          // 字节间隙超时：若已有数据则结束
+          if !acc.is_empty() {
+            break;
+          }
+        }
+      }
+    }
+    if acc.is_empty() {
+      Err("RTU 读响应超时".into())
+    } else {
+      Ok(acc)
+    }
+  }
+
+  async fn read_input(&mut self, address: u16, qty: u16) -> Result<Vec<u16>, String> {    let mut pdu = vec![0x04];
+    pdu.extend_from_slice(&address.to_be_bytes());
+    pdu.extend_from_slice(&qty.to_be_bytes());
+    let resp = self.transaction(&pdu).await?;
+    if resp.len() < 2 || resp[0] != 0x04 {
+      return Err("输入寄存器响应无效".into());
+    }
+    let bc = resp[1] as usize;
+    if resp.len() < 2 + bc {
+      return Err("输入寄存器数据不完整".into());
+    }
+    let mut out = Vec::new();
+    let mut i = 2;
+    while i + 1 < 2 + bc {
+      out.push(u16::from_be_bytes([resp[i], resp[i + 1]]));
+      i += 2;
+    }
+    Ok(out)
+  }
+}
+
 fn u32_from_regs(high: u16, low: u16) -> u32 {
   ((high as u32) << 16) | (low as u32)
 }
@@ -340,19 +533,193 @@ async fn load_targets(pool: &crate::db::DbPool) -> Vec<PollTarget> {
      FROM ph_sensor s
      INNER JOIN ph_sensor_device_config c ON c.sensor_id = s.id
      WHERE s.status = 1 AND s.category = 'particle'
-       AND UPPER(c.protocol) LIKE 'MODBUSTCP%'",
+       AND (
+         UPPER(c.protocol) LIKE 'MODBUSTCP%'
+         OR UPPER(c.protocol) LIKE 'MODBUSRTU%'
+       )",
   )
   .fetch_all(pool)
   .await
   .unwrap_or_default()
 }
 
-async fn poll_one(pool: &crate::db::DbPool, t: &PollTarget) -> bool {
-  let code = t
-    .device_code
+fn device_code_of(t: &PollTarget) -> String {
+  t.device_code
     .clone()
     .filter(|s| !s.is_empty())
-    .unwrap_or_else(|| t.custom_id.clone());
+    .unwrap_or_else(|| t.custom_id.clone())
+}
+
+async fn poll_one(pool: &crate::db::DbPool, t: &PollTarget) -> bool {
+  let proto = t.protocol.to_uppercase();
+  if proto.contains("MODBUSRTU") {
+    poll_one_rtu(pool, t).await
+  } else {
+    poll_one_tcp(pool, t).await
+  }
+}
+
+/// RS-485 / USB-串口：FC04 Input Register（与 Modscan32 验证参数一致）
+async fn poll_one_rtu(pool: &crate::db::DbPool, t: &PollTarget) -> bool {
+  let code = device_code_of(t);
+  let Some(raw_port) = t.plc_ip.as_ref() else {
+    log_warn(
+      Some(t.sensor_id),
+      Some(&code),
+      None,
+      "skip",
+      "ModbusRTU 未配置串口（请在「PLC IP」填 COM3 或 COM3@19200）",
+      None,
+      None,
+    );
+    return false;
+  };
+  let Some((port, baud)) = parse_serial_endpoint(raw_port) else {
+    log_warn(
+      Some(t.sensor_id),
+      Some(&code),
+      Some(raw_port),
+      "skip",
+      "串口名无效（示例：COM3 / COM3@19200）",
+      None,
+      None,
+    );
+    return false;
+  };
+
+  let unit = parse_unit_id(&t.slave_address);
+  let count = std::env::var("MODBUS_RTU_INPUT_COUNT")
+    .ok()
+    .and_then(|s| s.parse().ok())
+    .unwrap_or(DEFAULT_RTU_INPUT_COUNT)
+    .clamp(10, 20);
+  let started = Instant::now();
+  let endpoint = format!("{port}@{baud}");
+
+  log_info(
+    Some(t.sensor_id),
+    Some(&code),
+    Some(&endpoint),
+    "connect",
+    &format!("RTU 打开串口 unit={unit} FC04 addr=0 count={count}"),
+    None,
+    None,
+  );
+
+  let mut client = match ModbusRtu::open(&port, baud, unit).await {
+    Ok(c) => c,
+    Err(e) => {
+      let ms = started.elapsed().as_millis() as u64;
+      log_error(
+        Some(t.sensor_id),
+        Some(&code),
+        Some(&endpoint),
+        "connect",
+        &e,
+        None,
+        Some(ms),
+      );
+      let _ = sqlx::query(
+        "UPDATE ph_sensor SET com_alarm = 1, runtime_state = 'Offline', updated_at = datetime('now') WHERE id = ?",
+      )
+      .bind(t.sensor_id)
+      .execute(pool)
+      .await;
+      return false;
+    }
+  };
+
+  let regs = match client.read_input(0, count).await {
+    Ok(v) => v,
+    Err(e) => {
+      let ms = started.elapsed().as_millis() as u64;
+      log_error(
+        Some(t.sensor_id),
+        Some(&code),
+        Some(&endpoint),
+        "read_input",
+        &e,
+        None,
+        Some(ms),
+      );
+      let _ = sqlx::query(
+        "UPDATE ph_sensor SET com_alarm = 1, runtime_state = 'Offline', updated_at = datetime('now') WHERE id = ?",
+      )
+      .bind(t.sensor_id)
+      .execute(pool)
+      .await;
+      return false;
+    }
+  };
+
+  let f_abcd_01 = if regs.len() >= 2 {
+    Some(regs_to_f32_abcd(regs[0], regs[1]))
+  } else {
+    None
+  };
+  let f_cdab_01 = if regs.len() >= 2 {
+    Some(regs_to_f32_cdab(regs[0], regs[1]))
+  } else {
+    None
+  };
+  let f_abcd_23 = if regs.len() >= 4 {
+    Some(regs_to_f32_abcd(regs[2], regs[3]))
+  } else {
+    None
+  };
+
+  let last_value = json!({
+    "protocol": "ModbusRTU",
+    "port": port,
+    "baud": baud,
+    "unitId": unit,
+    "raw": regs,
+    "floatABCD": { "reg0_1": f_abcd_01, "reg2_3": f_abcd_23 },
+    "floatCDAB": { "reg0_1": f_cdab_01 },
+    // 卡片优先展示：原始前两字 + ABCD 浮点（现场按手册选字序）
+    "0.5um": f_abcd_01,
+    "5.0um": f_abcd_23,
+  });
+
+  let _ = sqlx::query(
+    "UPDATE ph_sensor
+     SET com_alarm = 0,
+         runtime_state = 'Idle',
+         last_value = ?,
+         updated_at = datetime('now')
+     WHERE id = ?",
+  )
+  .bind(&last_value)
+  .bind(t.sensor_id)
+  .execute(pool)
+  .await;
+
+  let ms = started.elapsed().as_millis() as u64;
+  let raw_preview: Vec<String> = regs
+    .iter()
+    .enumerate()
+    .take(8)
+    .map(|(i, v)| format!("[{i}]={v}"))
+    .collect();
+  log_info(
+    Some(t.sensor_id),
+    Some(&code),
+    Some(&endpoint),
+    "poll_ok",
+    &format!(
+      "RTU FC04 ok raw={} abcd01={:?} cdab01={:?}",
+      raw_preview.join(" "),
+      f_abcd_01,
+      f_cdab_01
+    ),
+    Some(json!({ "lastValue": last_value })),
+    Some(ms),
+  );
+  true
+}
+
+async fn poll_one_tcp(pool: &crate::db::DbPool, t: &PollTarget) -> bool {
+  let code = device_code_of(t);
   let Some(plc) = t.plc_ip.as_ref() else {
     log_warn(
       Some(t.sensor_id),
@@ -719,7 +1086,7 @@ async fn test_one(
 ) -> Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiError>)> {
   let targets = load_targets(&state.pool).await;
   let Some(t) = targets.into_iter().find(|x| x.sensor_id == body.sensor_id) else {
-    return Err(err(4040, "未找到可轮询的粒子设备配置（需 ModbusTCP + 有效 IP）"));
+    return Err(err(4040, "未找到可轮询的粒子设备配置（需 ModbusTCP+IP 或 ModbusRTU+COM）"));
   };
   log_info(
     Some(t.sensor_id),
