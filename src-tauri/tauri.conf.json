@@ -34,7 +34,7 @@
       },
       "resources": [],
       "shortDescription": "",
-      "targets": "none",
+      "targets": "all",
       "windows": {
         "certificateThumbprint": null,
         "digestAlgorithm": "sha256",
